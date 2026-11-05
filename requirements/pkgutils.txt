@@ -1,5 +1,5 @@
 setuptools>=47.0.0
-wheel>=0.29.0
+wheel>=0.48.0
 flake8==7.3.0
 tox>=4.4.8
 sphinx2rst>=1.0
