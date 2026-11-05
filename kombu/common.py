@@ -13,6 +13,7 @@ from uuid import NAMESPACE_OID, uuid3, uuid4, uuid5
 
 from amqp import ChannelError, RecoverableConnectionError
 
+from .declaration import CACHE_COMMIT, CACHE_HIT, record_commit
 from .entity import Exchange, Queue
 from .log import get_logger
 from .serialization import registry as serializers
@@ -148,6 +149,9 @@ def _maybe_declare(entity, channel):
         declared = channel.connection.client.declared_entities
         ident = hash(entity)
         if ident in declared:
+            # cache gate cut: nothing is emitted to the broker.
+            record_commit(channel, CACHE_HIT, entity=orig,
+                          name=getattr(orig, 'name', ''), ident=ident)
             return False
 
     if not channel.connection:
@@ -155,6 +159,10 @@ def _maybe_declare(entity, channel):
     entity.declare(channel=channel)
     if declared is not None and ident:
         declared.add(ident)
+        # cache write cut: the ident is now a committed declared_entities
+        # fact and must not be popped when a ledger scope exits.
+        record_commit(channel, CACHE_COMMIT, entity=orig,
+                      name=getattr(entity, 'name', ''), ident=ident)
     if orig is not None:
         orig.name = entity.name
     return True

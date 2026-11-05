@@ -8,10 +8,17 @@ from unittest.mock import ANY, Mock, patch
 import pytest
 
 from kombu import Connection, Consumer, Exchange, Producer, Queue
+from kombu.declaration import (
+    CACHE_COMMIT, CACHE_HIT, EXCHANGE_DECLARED, QUEUE_BOUND, QUEUE_DECLARED,
+)
 from kombu.exceptions import MessageStateError, OperationalError
 from kombu.utils import json
 from kombu.utils.functional import ChannelPromise
 from t.mocks import Transport
+
+
+def _commit_kinds(scope):
+    return [c.kind for c in scope.commits]
 
 
 class test_Producer:
@@ -71,6 +78,30 @@ class test_Producer:
         # p.declare() declares exchange')
         p.declare()
         assert 'exchange_declare' in channel
+
+    def test_publish_declare_list_orchestrated_through_cache_gate(self):
+        # Producer.publish never declares directly: its declare list is
+        # orchestrated through common.maybe_declare, so the second publish
+        # of the same queue is a bare cache hit.
+        channel = self.connection.channel()
+        producer = Producer(channel, Exchange(''), auto_declare=False)
+        queue = Queue('pfoo', self.exchange, 'rkey')
+
+        with self.connection.declaration_ledger() as scope:
+            producer.publish('a', declare=[queue])
+            assert _commit_kinds(scope) == [
+                EXCHANGE_DECLARED, QUEUE_DECLARED, QUEUE_BOUND, CACHE_COMMIT,
+            ]
+            producer.publish('b', declare=[queue])
+            assert _commit_kinds(scope) == [
+                EXCHANGE_DECLARED, QUEUE_DECLARED, QUEUE_BOUND, CACHE_COMMIT,
+                CACHE_HIT,
+            ]
+
+        assert channel.called.count('exchange_declare') == 1
+        assert channel.called.count('queue_declare') == 1
+        assert channel.called.count('queue_bind') == 1
+        assert hash(queue) in self.connection.declared_entities
 
     def test_prepare(self):
         message = {'the quick brown fox': 'jumps over the lazy dog'}
@@ -519,6 +550,52 @@ class test_Consumer:
 
         consumer.consume()
         assert 'basic_consume' in channel
+
+    def test_declare_is_direct_multistep_without_cache_gate(self):
+        # Consumer.declare calls Queue.declare directly: the multi-step
+        # assembly is committed every time and never produces cache
+        # hits/commits, even when the same queue is declared twice.
+        channel = self.connection.channel()
+        queue = Queue('cfoo', self.exchange, 'rkey')
+        consumer = Consumer(channel, queue, auto_declare=False)
+
+        with self.connection.declaration_ledger() as scope:
+            consumer.declare()
+            consumer.declare()
+            assert _commit_kinds(scope) == [
+                EXCHANGE_DECLARED, QUEUE_DECLARED, QUEUE_BOUND,
+                EXCHANGE_DECLARED, QUEUE_DECLARED, QUEUE_BOUND,
+            ]
+
+        assert channel.called.count('exchange_declare') == 2
+        assert channel.called.count('queue_declare') == 2
+        assert channel.called.count('queue_bind') == 2
+        assert self.connection.declared_entities == set()
+
+    def test_consumer_direct_declare_forks_from_producer_cache_gate(self):
+        # even though the Producer path already cached the queue, the
+        # Consumer path still performs its direct multi-step assembly, and
+        # both orchestrations are attributed to the same connection ledger
+        # in causal order across two different channels.
+        producer_channel = self.connection.channel()
+        consumer_channel = self.connection.channel()
+        producer = Producer(producer_channel, Exchange(''), auto_declare=False)
+        queue = Queue('shared', self.exchange, 'rkey')
+        consumer = Consumer(consumer_channel, queue, auto_declare=False)
+
+        with self.connection.declaration_ledger() as scope:
+            producer.publish('a', declare=[queue])
+            consumer.declare()
+            assert _commit_kinds(scope) == [
+                EXCHANGE_DECLARED, QUEUE_DECLARED, QUEUE_BOUND, CACHE_COMMIT,
+                EXCHANGE_DECLARED, QUEUE_DECLARED, QUEUE_BOUND,
+            ]
+
+        # consumer channel is a different channel but the same connection
+        assert scope.commits[-1].seq > scope.commits[0].seq
+        assert producer_channel is not consumer_channel
+        assert producer_channel.connection.client is self.connection
+        assert consumer_channel.connection.client is self.connection
 
     def test_consume__cancel(self):
         channel = self.connection.channel()

@@ -51,6 +51,7 @@ from types import ModuleType  # noqa
 
 all_by_module = {
     'kombu.connection': ['Connection', 'BrokerConnection'],
+    'kombu.declaration': ['DeclarationLedger'],
     'kombu.entity': ['Exchange', 'Queue', 'binding'],
     'kombu.message': ['Message'],
     'kombu.messaging': ['Consumer', 'Producer'],

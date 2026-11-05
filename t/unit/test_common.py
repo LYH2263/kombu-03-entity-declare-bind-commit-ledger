@@ -7,14 +7,21 @@ from unittest.mock import Mock, patch
 import pytest
 from amqp import RecoverableConnectionError
 
-from kombu import common
+from kombu import Connection, Exchange, Queue, common
 from kombu.common import (PREFETCH_COUNT_MAX, Broadcast, QoS, collect_replies,
                           declaration_cached, generate_oid, ignore_errors,
                           maybe_declare, send_reply)
-from t.mocks import ContextMock, MockPool
+from kombu.declaration import (
+    CACHE_COMMIT, CACHE_HIT, EXCHANGE_DECLARED, QUEUE_DECLARED,
+)
+from t.mocks import ContextMock, MockPool, Transport
 
 if TYPE_CHECKING:
     from types import TracebackType
+
+
+def _commit_kinds(scope):
+    return [c.kind for c in scope.commits]
 
 
 def test_generate_oid():
@@ -204,13 +211,109 @@ class test_maybe_declare:
         entity = self._get_mock_entity(
             is_bound=True, can_cache_declaration=True)
         entity.channel = channel
-        assert entity.is_bound, "Expected entity is bound to begin this test."
+        assert entity.is_bound, "Expected entity is bound to begin test."
         # When: Entity channel connection has gone away
         entity.channel.connection = None
         # When: calling maybe_declare with retry
         # Then: the RecoverableConnectionError should be raised
         with pytest.raises(RecoverableConnectionError):
             maybe_declare(entity, channel, retry=True)
+
+    def _get_bound_channel(self):
+        conn = Connection(transport=Transport)
+        conn.connect()
+        return conn, conn.channel()
+
+    def test_cache_miss_commits_then_cache_hit_short_circuits(self):
+        # cache gate fork: first call declares and writes declared_entities,
+        # second call is a cache hit that emits no broker command at all.
+        conn, channel = self._get_bound_channel()
+        entity = Exchange('cachex', 'direct')(channel)
+
+        with conn.declaration_ledger() as scope:
+            assert maybe_declare(entity, channel) is True
+            assert _commit_kinds(scope) == [
+                EXCHANGE_DECLARED, CACHE_COMMIT,
+            ]
+            assert hash(entity) in conn.declared_entities
+
+            assert maybe_declare(entity, channel) is False
+            assert _commit_kinds(scope) == [
+                EXCHANGE_DECLARED, CACHE_COMMIT, CACHE_HIT,
+            ]
+
+        assert channel.called.count('exchange_declare') == 1
+        # the cache write is a committed fact and survives scope exit
+        assert hash(entity) in conn.declared_entities
+        assert scope.commits  # ledger did not pop its commits
+
+    def test_can_cache_false_exchange_auto_delete_never_uses_gate(self):
+        # can_cache fork on Exchange: auto_delete entities are declared on
+        # every call and never touch the declared_entities cache.
+        conn, channel = self._get_bound_channel()
+        entity = Exchange('adx', 'direct', auto_delete=True)(channel)
+
+        with conn.declaration_ledger() as scope:
+            assert maybe_declare(entity, channel) is True
+            assert maybe_declare(entity, channel) is True
+            assert _commit_kinds(scope) == [
+                EXCHANGE_DECLARED, EXCHANGE_DECLARED,
+            ]
+
+        assert channel.called.count('exchange_declare') == 2
+        assert conn.declared_entities == set()
+
+    @pytest.mark.parametrize('queue', [
+        pytest.param(
+            Queue('expq', queue_arguments={'x-expires': 1000}),
+            id='x-expires',
+        ),
+        pytest.param(Queue('adq', auto_delete=True), id='auto_delete'),
+    ])
+    def test_can_cache_false_queue_never_uses_gate(self, queue):
+        # can_cache fork on Queue: x-expires or auto_delete queues go through
+        # the multi-step assembly every time, with no cache commits.
+        conn, channel = self._get_bound_channel()
+        entity = queue(channel)
+
+        with conn.declaration_ledger() as scope:
+            assert maybe_declare(entity, channel) is True
+            assert maybe_declare(entity, channel) is True
+            assert _commit_kinds(scope) == [QUEUE_DECLARED, QUEUE_DECLARED]
+
+        assert channel.called.count('queue_declare') == 2
+        assert conn.declared_entities == set()
+
+    def test_retry_path_declaration_goes_through_the_same_ledger(self):
+        # the retry path wraps the declaration in Connection.ensure but the
+        # completion surface is unchanged: commits are still recorded.
+        conn, channel = self._get_bound_channel()
+        entity = Exchange('retryx', 'direct')(channel)
+
+        with conn.declaration_ledger() as scope:
+            assert maybe_declare(entity, channel, retry=True) is True
+            assert _commit_kinds(scope) == [
+                EXCHANGE_DECLARED, CACHE_COMMIT,
+            ]
+            assert maybe_declare(entity, channel, retry=True) is False
+            assert _commit_kinds(scope)[-1] == CACHE_HIT
+
+    def test_nested_scope_cache_hit_does_not_write_through_outer(self):
+        conn, channel = self._get_bound_channel()
+        entity = Exchange('nestx', 'direct')(channel)
+
+        with conn.declaration_ledger() as outer:
+            maybe_declare(entity, channel)
+            prefix = tuple(outer.commits)
+            with conn.declaration_ledger() as inner:
+                # cached in the outer scope: inner only records the hit
+                assert maybe_declare(entity, channel) is False
+                assert _commit_kinds(inner) == [CACHE_HIT]
+                assert tuple(outer.commits) == prefix
+            assert tuple(outer.commits[:len(prefix)]) == prefix
+            assert _commit_kinds(outer)[len(prefix):] == [CACHE_HIT]
+        # declared_entities is not mutated by the inner hit
+        assert conn.declared_entities == {hash(entity)}
 
 
 class test_replies:

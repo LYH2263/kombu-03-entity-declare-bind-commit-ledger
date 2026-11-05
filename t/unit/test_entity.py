@@ -7,9 +7,19 @@ import pytest
 
 from kombu import Connection, Exchange, Producer, Queue, binding
 from kombu.abstract import MaybeChannelBound
+from kombu.declaration import (
+    EXCHANGE_BOUND,
+    EXCHANGE_DECLARED,
+    QUEUE_BOUND,
+    QUEUE_DECLARED,
+)
 from kombu.exceptions import NotBoundError
 from kombu.serialization import registry
 from t.mocks import Transport
+
+
+def _commit_kinds(scope):
+    return [c.kind for c in scope.commits]
 
 
 def get_conn() -> Connection:
@@ -52,6 +62,52 @@ class test_binding:
         x = binding(Exchange('foo'))
         x.unbind(Exchange('bar')(chan))
         assert 'exchange_unbind' in chan
+
+    def test_declare_records_only_the_exchange_cut(self) -> None:
+        # binding.declare only declares the source exchange: it must never
+        # be conflated with the bind_to cut on the entity.
+        conn = get_conn()
+        chan = conn.channel()
+        b = binding(Exchange('foo'), 'rkey')
+        with conn.declaration_ledger() as scope:
+            b.declare(chan)
+        assert _commit_kinds(scope) == [EXCHANGE_DECLARED]
+        assert 'queue_bind' not in chan
+        assert 'exchange_bind' not in chan
+
+    def test_bind_records_only_the_bind_to_cut(self) -> None:
+        # binding.bind performs bind_to on the entity and does not declare
+        # the source exchange again.
+        conn = get_conn()
+        chan = conn.channel()
+        b = binding(Exchange('foo'), 'rkey')
+        q = Queue('qname', Exchange('foo'), 'rkey')
+        with conn.declaration_ledger() as scope:
+            b.bind(q(chan))
+        assert _commit_kinds(scope) == [QUEUE_BOUND]
+        assert 'exchange_declare' not in chan
+        commit = scope.commits[0]
+        assert commit.name == 'qname'
+        assert commit.exchange == 'foo'
+        assert commit.routing_key == 'rkey'
+
+    def test_bind_exchange_to_exchange_records_exchange_bound(self) -> None:
+        conn = get_conn()
+        chan = conn.channel()
+        b = binding(Exchange('foo'), 'rkey')
+        with conn.declaration_ledger() as scope:
+            b.bind(Exchange('bar')(chan))
+        assert _commit_kinds(scope) == [EXCHANGE_BOUND]
+        assert scope.commits[0].name == 'bar'
+        assert scope.commits[0].exchange == 'foo'
+
+    def test_unbind_is_not_a_declaration_commit(self) -> None:
+        conn = get_conn()
+        chan = conn.channel()
+        b = binding(Exchange('foo'), 'rkey')
+        with conn.declaration_ledger() as scope:
+            b.unbind(Exchange('bar')(chan))
+        assert scope.commits == ()
 
     def test_repr(self) -> None:
         b = binding(Exchange('foo'), 'rkey')
@@ -206,6 +262,29 @@ class test_Exchange:
         foo = Exchange('foo', 'topic', no_declare=False)
         foo(chan).declare()
         assert 'exchange_declare' in chan
+
+    def test_declare_is_a_single_step_commit(self) -> None:
+        # the exchange completion surface is exactly one exchange_declare
+        # commit, never the multi-step assembly used by Queue.declare.
+        conn = get_conn()
+        chan = conn.channel()
+        with conn.declaration_ledger() as scope:
+            Exchange('foo', 'topic')(chan).declare()
+        assert _commit_kinds(scope) == [EXCHANGE_DECLARED]
+        assert scope.commits[0].name == 'foo'
+
+    @pytest.mark.parametrize('exchange', [
+        pytest.param(Exchange('amq.rabbitmq.trace', 'topic'), id='amq-prefix'),
+        pytest.param(Exchange('foo', no_declare=True), id='no_declare'),
+        pytest.param(Exchange(''), id='empty-name'),
+    ])
+    def test_skipped_declare_emits_no_commit(self, exchange) -> None:
+        conn = get_conn()
+        chan = conn.channel()
+        with conn.declaration_ledger() as scope:
+            exchange(chan).declare()
+        assert scope.commits == ()
+        assert 'exchange_declare' not in chan
 
 
 class test_Queue:
@@ -371,6 +450,61 @@ class test_Queue:
         assert 'exchange_declare' in chan
         assert 'queue_declare' in chan
         assert 'queue_bind' in chan
+
+    def test_declare_records_exchange_queue_bind_multi_steps(self) -> None:
+        # the queue completion surface is a multi-step assembly, and every
+        # step is a distinct commit in causal order - not a single declare.
+        conn = get_conn()
+        chan = conn.channel()
+        with conn.declaration_ledger() as scope:
+            Queue('foo', self.exchange, 'rkey', channel=chan).declare()
+        assert _commit_kinds(scope) == [
+            EXCHANGE_DECLARED, QUEUE_DECLARED, QUEUE_BOUND,
+        ]
+        bound = scope.commits[-1]
+        assert bound.name == 'foo'
+        assert bound.exchange == 'foo'
+        assert bound.routing_key == 'rkey'
+
+    def test_declare_with_bindings_records_two_cuts_per_binding(self) -> None:
+        conn = get_conn()
+        chan = conn.channel()
+        q = Queue('mul', [
+            binding(Exchange('mul1'), 'rkey1'),
+            binding(Exchange('mul2'), 'rkey2'),
+        ])
+        with conn.declaration_ledger() as scope:
+            q(chan).declare()
+        # assembly starts at queue_declare (no main exchange), then every
+        # binding contributes its own exchange cut and bind_to cut (the
+        # bindings container is a set, so cross-binding order is not fixed).
+        assert _commit_kinds(scope) == [
+            QUEUE_DECLARED,
+            EXCHANGE_DECLARED, QUEUE_BOUND,
+            EXCHANGE_DECLARED, QUEUE_BOUND,
+        ]
+        binds = {(c.exchange, c.routing_key)
+                 for c in scope.commits if c.kind == QUEUE_BOUND}
+        assert binds == {('mul1', 'rkey1'), ('mul2', 'rkey2')}
+        declared = {(c.name)
+                    for c in scope.commits if c.kind == EXCHANGE_DECLARED}
+        assert declared == {'mul1', 'mul2'}
+
+    def test_anonymous_queue_commit_carries_generated_name(self) -> None:
+        conn = Connection('memory://')
+        chan = conn.channel()
+        bound = Queue(exchange=Exchange('anonex'))(chan)
+        assert bound.name == ''
+        with conn.declaration_ledger() as scope:
+            bound.declare()
+        assert _commit_kinds(scope) == [
+            EXCHANGE_DECLARED, QUEUE_DECLARED, QUEUE_BOUND,
+        ]
+        declared = scope.commits[1]
+        assert declared.name.startswith('amq.gen-')
+        # the commit records the broker generated name that was written back
+        assert declared.name == bound.name
+        conn.release()
 
     def test_get(self) -> None:
         b = Queue('foo', self.exchange, 'foo', channel=get_conn().channel())

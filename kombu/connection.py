@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover
 # (Issue #112)
 from kombu import exceptions
 
+from .declaration import DeclarationLedger
 from .log import get_logger
 from .resource import Resource
 from .transport import get_transport_cls, supports_librabbitmq
@@ -145,6 +146,9 @@ class Connection:
     #: in case the server loses data.
     declared_entities = None
 
+    #: Per-connection commit ledger of declared entities and bindings.
+    _declaration_ledger = None
+
     #: Iterator returning the next broker URL to try in the event
     #: of connection failure (initialized by :attr:`failover_strategy`).
     cycle = None
@@ -235,6 +239,32 @@ class Connection:
 
         self.declared_entities = set()
 
+        # Entity declaration/binding commit ledger, scoped to this
+        # connection. Opened explicitly by hosts via declaration_ledger();
+        # until then all declaration entry points behave unchanged.
+        self._declaration_ledger = DeclarationLedger(self)
+
+    def declaration_ledger(self):
+        """Open an entity declaration/binding commit boundary.
+
+        Returns a context manager yielding a ledger scope that records, in
+        causal order, every committed ``exchange_declare``/``queue_declare``/
+        ``queue_bind``/``exchange_bind`` step emitted on this connection as
+        well as the ``maybe_declare`` cache hits/commits.
+
+        Scopes can be nested: commits made inside an inner scope stay on it
+        while it is open and are appended to the parent scope when the inner
+        one exits.  Broker side effects already emitted and idents already
+        stored in :attr:`declared_entities` are never rolled back - this is a
+        commit ledger, not an intent window::
+
+            with connection.declaration_ledger() as ledger:
+                maybe_declare(queue, channel)
+            ledger.commits
+
+        """
+        return self._declaration_ledger.open()
+
     def switch(self, conn_str):
         """Switch connection parameters to use a new URL or hostname.
 
@@ -248,6 +278,7 @@ class Connection:
         """
         self.close()
         self.declared_entities.clear()
+        self._declaration_ledger.reset()
         self._closed = False
         conn_params = (
             parse_url(conn_str) if "://" in conn_str else {"hostname": conn_str}
@@ -352,6 +383,7 @@ class Connection:
     def _do_close_self(self):
         # Close only connection and channel(s), but not transport.
         self.declared_entities.clear()
+        self._declaration_ledger.reset()
         if self._default_channel:
             self.maybe_close_channel(self._default_channel)
         if self._connection:
@@ -393,6 +425,7 @@ class Connection:
 
         self._do_close_transport()
         self.declared_entities.clear()
+        self._declaration_ledger.reset()
         self._connection = None
 
     def release(self):

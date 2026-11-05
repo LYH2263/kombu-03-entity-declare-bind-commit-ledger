@@ -5,6 +5,13 @@ from __future__ import annotations
 import numbers
 
 from .abstract import MaybeChannelBound, Object
+from .declaration import (
+    EXCHANGE_BOUND,
+    EXCHANGE_DECLARED,
+    QUEUE_BOUND,
+    QUEUE_DECLARED,
+    record_commit,
+)
 from .exceptions import ContentDisallowed
 from .serialization import prepare_accept_content
 
@@ -181,11 +188,17 @@ class Exchange(MaybeChannelBound):
         """
         if self._can_declare():
             passive = self.passive if passive is None else passive
-            return (channel or self.channel).exchange_declare(
+            channel = channel or self.channel
+            ret = channel.exchange_declare(
                 exchange=self.name, type=self.type, durable=self.durable,
                 auto_delete=self.auto_delete, arguments=self.arguments,
                 nowait=nowait, passive=passive,
             )
+            # single-step completion surface: exchange_declare is the only
+            # broker command this method emits.
+            record_commit(channel, EXCHANGE_DECLARED, entity=self,
+                          name=self.name)
+            return ret
 
     def bind_to(self, exchange='', routing_key='',
                 arguments=None, nowait=False, channel=None, **kwargs):
@@ -199,13 +212,18 @@ class Exchange(MaybeChannelBound):
         """
         if isinstance(exchange, Exchange):
             exchange = exchange.name
-        return (channel or self.channel).exchange_bind(
+        channel = channel or self.channel
+        ret = channel.exchange_bind(
             destination=self.name,
             source=exchange,
             routing_key=routing_key,
             nowait=nowait,
             arguments=arguments,
         )
+        record_commit(channel, EXCHANGE_BOUND, entity=self,
+                      name=self.name, exchange=exchange,
+                      routing_key=routing_key, arguments=arguments)
+        return ret
 
     def unbind_from(self, source='', routing_key='',
                     nowait=False, arguments=None, channel=None):
@@ -662,7 +680,10 @@ class Queue(MaybeChannelBound):
             nowait=nowait,
         )
         if not self.name:
+            # anonymous queue: the broker generated the name, write it back
+            # before recording the commit.
             self.name = ret[0]
+        record_commit(channel, QUEUE_DECLARED, entity=self, name=self.name)
         if self.on_declared:
             self.on_declared(*ret)
         return ret
@@ -678,13 +699,18 @@ class Queue(MaybeChannelBound):
         if isinstance(exchange, Exchange):
             exchange = exchange.name
 
-        return (channel or self.channel).queue_bind(
+        channel = channel or self.channel
+        ret = channel.queue_bind(
             queue=self.name,
             exchange=exchange,
             routing_key=routing_key,
             arguments=arguments,
             nowait=nowait,
         )
+        record_commit(channel, QUEUE_BOUND, entity=self, name=self.name,
+                      exchange=exchange, routing_key=routing_key,
+                      arguments=arguments)
+        return ret
 
     def get(self, no_ack=None, accept=None):
         """Poll the server for a new message.
